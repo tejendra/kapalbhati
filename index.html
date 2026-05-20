@@ -431,7 +431,7 @@
           <span>per second</span>
         </button>
       </div>
-      <p id="speedMeta" class="speed-meta">Metronome ticks mark each sharp exhale. Do not consciously inhale; inhale is
+      <p id="speedMeta" class="speed-meta">Tones mark each sharp exhale. Do not consciously inhale; inhale is
         passive as abdomen relaxes outward.</p>
     </div>
 
@@ -471,13 +471,16 @@
     const panelFieldsEl = document.getElementById('panelFields');
     const speedVisualEl = document.getElementById('speedVisual');
 
-    const SESSION_MS = 15 * 60 * 1000;
+    const SESSION_MS = 1 * 10 * 1000;
     const PREP_SECONDS = 3;
     const STORAGE_PREFIX = 'kapalBhati.v1.';
 
     let cancel = null;
     let rafId = 0;
     let ringClearTimerId = 0;
+    /** @type {WakeLockSentinel | null} */
+    let screenWakeLock = null;
+    let wantScreenWakeLock = false;
 
     const AudioContextCtor =
       typeof AudioContext !== 'undefined'
@@ -508,37 +511,84 @@
       }
     }
 
-    /** Short metronome-style click (band-passed noise burst). */
-    function playTick() {
+    async function acquireScreenWakeLock() {
+      if (!wantScreenWakeLock || !('wakeLock' in navigator)) return;
+      try {
+        screenWakeLock = await navigator.wakeLock.request('screen');
+        screenWakeLock.addEventListener('release', () => {
+          screenWakeLock = null;
+          if (wantScreenWakeLock && document.visibilityState === 'visible') {
+            void acquireScreenWakeLock();
+          }
+        });
+      } catch {
+        /* unsupported or permission denied */
+      }
+    }
+
+    async function releaseScreenWakeLock() {
+      wantScreenWakeLock = false;
+      if (!screenWakeLock) return;
+      try {
+        await screenWakeLock.release();
+      } catch {
+        /* already released */
+      }
+      screenWakeLock = null;
+    }
+
+    function onWakeLockVisibilityChange() {
+      if (document.visibilityState === 'visible' && wantScreenWakeLock) {
+        void acquireScreenWakeLock();
+      }
+    }
+
+    /** D major — distinct from prep/complete (C, E, G). */
+    const PREP_COUNTDOWN_FREQS = { 3: 523.25, 2: 659.25, 1: 783.99 };
+    const EXHALE_TICK_FREQS = [293.66, 369.99, 440];
+    let exhaleTickIndex = 0;
+
+    function playToneCueAt(freq, dur, startAt, peak = 0.2) {
       const bus = getAudioBus();
       if (!bus) return;
       const { ctx, master } = bus;
-      const t0 = ctx.currentTime;
-      const dur = 0.028;
-
-      const noiseBuf = ctx.createBuffer(1, Math.ceil(ctx.sampleRate * dur), ctx.sampleRate);
-      const ch = noiseBuf.getChannelData(0);
-      for (let i = 0; i < ch.length; i++) {
-        ch[i] = (Math.random() * 2 - 1) * (1 - i / ch.length);
-      }
-      const src = ctx.createBufferSource();
-      src.buffer = noiseBuf;
-
-      const bp = ctx.createBiquadFilter();
-      bp.type = 'bandpass';
-      bp.frequency.value = 1800;
-      bp.Q.value = 0.85;
-
+      const start = startAt ?? ctx.currentTime;
+      const osc = ctx.createOscillator();
+      osc.type = 'sine';
+      osc.frequency.value = freq;
       const g = ctx.createGain();
-      g.gain.setValueAtTime(0.0001, t0);
-      g.gain.linearRampToValueAtTime(0.55, t0 + 0.004);
-      g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
-
-      src.connect(bp);
-      bp.connect(g);
+      const attack = 0.04;
+      const holdUntil = start + dur * 0.55;
+      g.gain.setValueAtTime(0.0001, start);
+      g.gain.linearRampToValueAtTime(peak, start + attack);
+      g.gain.linearRampToValueAtTime(peak * 0.85, holdUntil);
+      g.gain.exponentialRampToValueAtTime(0.0001, start + dur);
+      osc.connect(g);
       g.connect(master);
-      src.start(t0);
-      src.stop(t0 + dur + 0.01);
+      osc.start(start);
+      osc.stop(start + dur + 0.02);
+    }
+
+    function playPrepCountdownTone(secondsLeft) {
+      const freq = PREP_COUNTDOWN_FREQS[secondsLeft];
+      if (freq) playToneCueAt(freq, 0.42);
+    }
+
+    /** Short sine tone on each exhale (D · F♯ · A, cycling). */
+    function playTick() {
+      const freq = EXHALE_TICK_FREQS[exhaleTickIndex % EXHALE_TICK_FREQS.length];
+      exhaleTickIndex += 1;
+      playToneCueAt(freq, 0.13, undefined, 0.17);
+    }
+
+    /** Three ascending tones when the 15-minute session finishes (not on early stop). */
+    function playSessionComplete() {
+      const bus = getAudioBus();
+      if (!bus) return;
+      const t0 = bus.ctx.currentTime;
+      playToneCueAt(523.25, 0.58, t0);
+      playToneCueAt(659.25, 0.58, t0 + 0.34);
+      playToneCueAt(783.99, 1.1, t0 + 0.68);
     }
 
     function pulseRing() {
@@ -661,11 +711,17 @@
       const start = performance.now();
       const end = start + totalSec * 1000;
       phaseEl.textContent = label;
+      let lastPrepCueSec = -1;
 
       while (true) {
         if (signal.aborted) return false;
         const now = performance.now();
         const remMs = Math.max(0, end - now);
+        const sec = parseInt(fmtWholeSec(remMs / 1000), 10);
+        if (sec >= 1 && sec <= totalSec && sec !== lastPrepCueSec) {
+          playPrepCountdownTone(sec);
+          lastPrepCueSec = sec;
+        }
         timerEl.textContent = fmtWholeSec(remMs / 1000);
         if (remMs <= 0) break;
         const delayMs = msUntilNextTimerDisplayUpdate(end, now);
@@ -692,6 +748,7 @@
         if (!(await runCountdown(signal, 'Get ready', PREP_SECONDS))) return;
 
         const sessionEndPerf = performance.now() + SESSION_MS;
+        exhaleTickIndex = 0;
         phaseEl.textContent = 'Exhale';
         timerEl.textContent = fmtMmSsFromMs(SESSION_MS);
         if (sessionWrapUpEl) {
@@ -713,6 +770,8 @@
             if (now >= sessionEndPerf) {
               cancelRaf();
               timerEl.textContent = '00:00';
+              phaseEl.textContent = 'Done';
+              playSessionComplete();
               resolve();
               return;
             }
@@ -732,9 +791,13 @@
         });
       };
 
+      document.addEventListener('visibilitychange', onWakeLockVisibilityChange);
+
       try {
         await run();
       } finally {
+        document.removeEventListener('visibilitychange', onWakeLockVisibilityChange);
+        void releaseScreenWakeLock();
         cancelRaf();
         if (ringClearTimerId) {
           clearTimeout(ringClearTimerId);
@@ -754,6 +817,8 @@
 
     startBtn.addEventListener('click', () => {
       unlockAudioFromUserGesture();
+      wantScreenWakeLock = true;
+      void acquireScreenWakeLock();
       startBtn.disabled = true;
       setSpeedTilesDisabled(true);
       setSessionUI(true);
