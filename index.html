@@ -431,7 +431,7 @@
           <span>per second</span>
         </button>
       </div>
-      <p id="speedMeta" class="speed-meta">Tones mark each sharp exhale. Do not consciously inhale; inhale is
+      <p id="speedMeta" class="speed-meta">Soft audio marks each sharp exhale. Do not consciously inhale; inhale is
         passive as abdomen relaxes outward.</p>
     </div>
 
@@ -489,26 +489,94 @@
           ? webkitAudioContext
           : null;
 
+    const NOISE_LOOP_SEC = 2;
+
     /** @type {{ ctx: AudioContext; master: GainNode } | null} */
     let audioBus = null;
+    /** @type {AudioBuffer | null} */
+    let noiseLoop = null;
+    /** @type {{ source: AudioBufferSourceNode; gain: GainNode } | null} */
+    let sessionBed = null;
 
     function getAudioBus() {
       if (!AudioContextCtor) return null;
       if (audioBus) return audioBus;
       const ctx = new AudioContextCtor();
       const master = ctx.createGain();
-      master.gain.value = 0.35;
+      master.gain.value = 1;
       master.connect(ctx.destination);
       audioBus = { ctx, master };
       return audioBus;
     }
 
+    function getNoiseLoop(ctx) {
+      if (noiseLoop) return noiseLoop;
+      const rate = ctx.sampleRate;
+      const len = Math.max(1, Math.floor(rate * NOISE_LOOP_SEC));
+      const buffer = ctx.createBuffer(1, len, rate);
+      const data = buffer.getChannelData(0);
+      let brown = 0;
+      for (let i = 0; i < len; i++) {
+        const white = Math.random() * 2 - 1;
+        brown = brown * 0.98 + white * 0.14;
+        data[i] = brown * 0.35;
+      }
+      noiseLoop = buffer;
+      return noiseLoop;
+    }
+
     function unlockAudioFromUserGesture() {
       const bus = getAudioBus();
       if (!bus) return;
+      getNoiseLoop(bus.ctx);
       if (bus.ctx.state === 'suspended') {
         void bus.ctx.resume();
       }
+    }
+
+    function startSessionBed() {
+      const bus = getAudioBus();
+      if (!bus) return;
+      const { ctx, master } = bus;
+      stopSessionBed(0.06);
+
+      const source = ctx.createBufferSource();
+      source.buffer = getNoiseLoop(ctx);
+      source.loop = true;
+
+      const filter = ctx.createBiquadFilter();
+      filter.type = 'lowpass';
+      filter.frequency.value = 260;
+      filter.Q.value = 0.45;
+
+      const gain = ctx.createGain();
+      source.connect(filter);
+      filter.connect(gain);
+      gain.connect(master);
+
+      const now = ctx.currentTime;
+      gain.gain.setValueAtTime(0.0001, now);
+      gain.gain.linearRampToValueAtTime(0.028, now + 0.4);
+
+      source.start(now);
+      sessionBed = { source, gain };
+    }
+
+    function stopSessionBed(fadeSec = 0.36) {
+      if (!sessionBed || !audioBus) return;
+      const { ctx } = audioBus;
+      const now = ctx.currentTime;
+      const { source, gain } = sessionBed;
+      gain.gain.cancelScheduledValues(now);
+      const v = Math.max(1e-4, gain.gain.value);
+      gain.gain.setValueAtTime(v, now);
+      gain.gain.linearRampToValueAtTime(0.0001, now + fadeSec);
+      try {
+        source.stop(now + fadeSec + 0.05);
+      } catch {
+        /* already stopped */
+      }
+      sessionBed = null;
     }
 
     async function acquireScreenWakeLock() {
@@ -543,12 +611,10 @@
       }
     }
 
-    /** D major — distinct from prep/complete (C, E, G). */
-    const PREP_COUNTDOWN_FREQS = { 3: 523.25, 2: 659.25, 1: 783.99 };
-    const EXHALE_TICK_FREQS = [293.66, 369.99, 440];
-    let exhaleTickIndex = 0;
+    /** G4 → A4 → B4 — same prep chimes as anulom-vilom. */
+    const PREP_COUNTDOWN_FREQS = { 3: 392, 2: 440, 1: 493.88 };
 
-    function playToneCueAt(freq, dur, startAt, peak = 0.2) {
+    function playChimeAt(freq, dur, startAt, peak = 0.12) {
       const bus = getAudioBus();
       if (!bus) return;
       const { ctx, master } = bus;
@@ -557,11 +623,9 @@
       osc.type = 'sine';
       osc.frequency.value = freq;
       const g = ctx.createGain();
-      const attack = 0.04;
-      const holdUntil = start + dur * 0.55;
+      const attack = 0.012;
       g.gain.setValueAtTime(0.0001, start);
       g.gain.linearRampToValueAtTime(peak, start + attack);
-      g.gain.linearRampToValueAtTime(peak * 0.85, holdUntil);
       g.gain.exponentialRampToValueAtTime(0.0001, start + dur);
       osc.connect(g);
       g.connect(master);
@@ -571,14 +635,69 @@
 
     function playPrepCountdownTone(secondsLeft) {
       const freq = PREP_COUNTDOWN_FREQS[secondsLeft];
-      if (freq) playToneCueAt(freq, 0.42);
+      if (freq) playChimeAt(freq, 0.3, undefined, 0.11);
     }
 
-    /** Short sine tone on each exhale (D · F♯ · A, cycling). */
+    /** Puff from the same brown bed, pre-shaped so it reads as breath not TV static. */
     function playTick() {
-      const freq = EXHALE_TICK_FREQS[exhaleTickIndex % EXHALE_TICK_FREQS.length];
-      exhaleTickIndex += 1;
-      playToneCueAt(freq, 0.13, undefined, 0.17);
+      const bus = getAudioBus();
+      if (!bus) return;
+      const { ctx, master } = bus;
+      const now = ctx.currentTime;
+      const dur = 0.074;
+      const peak = 0.75;
+
+      const bed = getNoiseLoop(ctx);
+      const bedSamples = bed.getChannelData(0);
+      const bedLen = bedSamples.length;
+      const len = Math.max(1, Math.floor(ctx.sampleRate * dur));
+      const burst = ctx.createBuffer(1, len, ctx.sampleRate);
+      const out = burst.getChannelData(0);
+      let pos = Math.floor(Math.random() * bedLen);
+      let prev = 0;
+      for (let i = 0; i < len; i++) {
+        const t = i / Math.max(1, len - 1);
+        const puff = Math.pow(Math.sin(Math.PI * t), 1.22);
+        const sample = bedSamples[pos];
+        const accent = sample - prev * 0.48;
+        prev = sample;
+        out[i] = (sample * 0.62 + accent * 0.38) * puff;
+        pos = (pos + 1) % bedLen;
+      }
+
+      const source = ctx.createBufferSource();
+      source.buffer = burst;
+
+      const highpass = ctx.createBiquadFilter();
+      highpass.type = 'highpass';
+      highpass.frequency.value = 380;
+      highpass.Q.value = 0.5;
+
+      const lowpass = ctx.createBiquadFilter();
+      lowpass.type = 'lowpass';
+      lowpass.frequency.value = 2450;
+      lowpass.Q.value = 0.55;
+
+      const presence = ctx.createBiquadFilter();
+      presence.type = 'peaking';
+      presence.frequency.value = 2050;
+      presence.Q.value = 0.7;
+      presence.gain.value = 3;
+
+      const gain = ctx.createGain();
+      source.connect(highpass);
+      highpass.connect(lowpass);
+      lowpass.connect(presence);
+      presence.connect(gain);
+      gain.connect(master);
+
+      gain.gain.setValueAtTime(0.0001, now);
+      gain.gain.linearRampToValueAtTime(peak, now + 0.01);
+      gain.gain.setValueAtTime(peak, now + 0.018);
+
+      const stopAt = now + dur + 0.005;
+      source.start(now);
+      source.stop(stopAt);
     }
 
     /** Three ascending tones when the 15-minute session finishes (not on early stop). */
@@ -586,9 +705,9 @@
       const bus = getAudioBus();
       if (!bus) return;
       const t0 = bus.ctx.currentTime;
-      playToneCueAt(523.25, 0.58, t0);
-      playToneCueAt(659.25, 0.58, t0 + 0.34);
-      playToneCueAt(783.99, 1.1, t0 + 0.68);
+      playChimeAt(392, 0.45, t0);
+      playChimeAt(440, 0.45, t0 + 0.28);
+      playChimeAt(493.88, 0.82, t0 + 0.56);
     }
 
     function pulseRing() {
@@ -748,7 +867,7 @@
         if (!(await runCountdown(signal, 'Get ready', PREP_SECONDS))) return;
 
         const sessionEndPerf = performance.now() + SESSION_MS;
-        exhaleTickIndex = 0;
+        startSessionBed();
         phaseEl.textContent = 'Exhale';
         timerEl.textContent = fmtMmSsFromMs(SESSION_MS);
         if (sessionWrapUpEl) {
@@ -771,6 +890,7 @@
               cancelRaf();
               timerEl.textContent = '00:00';
               phaseEl.textContent = 'Done';
+              stopSessionBed(0.28);
               playSessionComplete();
               resolve();
               return;
@@ -798,6 +918,7 @@
       } finally {
         document.removeEventListener('visibilitychange', onWakeLockVisibilityChange);
         void releaseScreenWakeLock();
+        stopSessionBed();
         cancelRaf();
         if (ringClearTimerId) {
           clearTimeout(ringClearTimerId);

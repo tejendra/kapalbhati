@@ -5,9 +5,9 @@ A minimal, single-page web app for guided **kapalbhati** (skull shining breath) 
 ## Features
 
 - **15-minute session** with a 3-second prep countdown
-- **Pace control**: 1, 1.5, or 2 exhales per second (metronome ticks on each exhale)
+- **Pace control**: 1, 1.5, or 2 exhales per second (soft audio pulse on each exhale)
 - **Visual cue**: pulsing ring on each tick
-- **Audio ticks** via the Web Audio API
+- **Audio cues** via the Web Audio API (brown-noise bed + exhale pulses; prep chimes match anulom-vilom)
 - **Screen wake lock** during a session (when the browser supports it)
 - **Remembers your pace** in `localStorage`
 - Collapsible **instructions** and a short **disclaimer** (not medical advice)
